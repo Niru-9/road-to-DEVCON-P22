@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import {
   useAccount,
-  useChainId,
   useConnect,
   useDisconnect,
   useReadContract,
@@ -9,11 +8,12 @@ import {
   useWaitForTransactionReceipt,
   useWriteContract,
 } from "wagmi";
-import { sepolia } from "wagmi/chains";
 import Board from "./components/Board";
 import { useGame } from "./hooks/useGame";
+import { useSelectedChain } from "./useSelectedChain";
 import { connectFourAbi, Status } from "./abi";
-import { GAME_ADDRESS, hasContractAddress } from "./wagmi";
+import { contractAddressFor, hasContractAddress } from "./wagmi";
+import { SUPPORTED_CHAINS, getChainMeta, isSupportedChain } from "./chains";
 
 function shortAddr(a?: string): string {
   if (!a) return "";
@@ -31,29 +31,53 @@ function fmtSeconds(seconds: bigint): string {
   return `${sec}s`;
 }
 
+// Map noisy provider/wallet messages to something a player can act on. Public
+// Sepolia RPC endpoints commonly answer 429 ("Too Many Requests") in bursts;
+// viem retries these automatically, so surface a clear, transient message
+// instead of dumping raw JSON at the user.
+function friendlyError(message: string): string {
+  if (/429|too many requests|rate ?limit/i.test(message)) {
+    return "The public RPC endpoint is rate-limiting requests (429). It retries automatically — wait a few seconds and try again, or set a private RPC URL in frontend/.env.";
+  }
+  return message.split("\n")[0];
+}
+
 export default function App() {
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, chainId: walletChainId } = useAccount();
   const { connect, connectors, isPending: connectPending } = useConnect();
   const { disconnect } = useDisconnect();
-  const chainId = useChainId();
   const { switchChain } = useSwitchChain();
+  const { selectedChainId, setSelectedChainId } = useSelectedChain();
+
+  const selectedMeta = getChainMeta(selectedChainId);
+  const gameAddress = contractAddressFor(selectedChainId);
+  const configured = gameAddress !== undefined;
+  const walletOnSelected = walletChainId === selectedChainId;
+  const walletUnsupported = walletChainId !== undefined && !isSupportedChain(walletChainId);
+  // Reads follow the selected chain; writes additionally require the wallet on
+  // that same chain and a configured address there.
+  const canWrite = isConnected && walletOnSelected && configured;
 
   const [gameId, setGameId] = useState<bigint | undefined>(undefined);
   const [gameIdInput, setGameIdInput] = useState("");
 
   const gameCount = useReadContract({
-    address: GAME_ADDRESS,
+    address: gameAddress,
     abi: connectFourAbi,
     functionName: "gameCount",
-    query: { enabled: hasContractAddress() },
+    chainId: selectedChainId,
+    query: { enabled: configured },
   });
 
-  const { state, boardArray, timeoutSeconds, refetchAll } = useGame(gameId);
+  const { state, boardArray, timeoutSeconds, refetchAll, game: gameRead } = useGame(
+    gameId,
+    selectedChainId,
+  );
 
   const { writeContract, data: txHash, isPending, error: writeError, reset } =
     useWriteContract();
   const { isLoading: txConfirming, isSuccess: txSuccess } =
-    useWaitForTransactionReceipt({ hash: txHash });
+    useWaitForTransactionReceipt({ hash: txHash, chainId: selectedChainId });
 
   // After a create-tx confirms, open the newly created game (id == gameCount).
   useEffect(() => {
@@ -66,8 +90,6 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [txSuccess, txHash]);
-
-  const onWrongChain = isConnected && chainId !== sepolia.id;
 
   function openGameById() {
     try {
@@ -82,37 +104,46 @@ export default function App() {
   }
 
   function createGame() {
+    if (!canWrite || !gameAddress) return;
     reset();
-    writeContract({ address: GAME_ADDRESS, abi: connectFourAbi, functionName: "createGame" });
+    writeContract({
+      address: gameAddress,
+      abi: connectFourAbi,
+      functionName: "createGame",
+      chainId: selectedChainId,
+    });
   }
 
   function joinGame() {
-    if (gameId === undefined) return;
+    if (!canWrite || !gameAddress || gameId === undefined) return;
     writeContract({
-      address: GAME_ADDRESS,
+      address: gameAddress,
       abi: connectFourAbi,
       functionName: "joinGame",
       args: [gameId],
+      chainId: selectedChainId,
     });
   }
 
   function makeMove(column: number) {
-    if (gameId === undefined) return;
+    if (!canWrite || !gameAddress || gameId === undefined) return;
     writeContract({
-      address: GAME_ADDRESS,
+      address: gameAddress,
       abi: connectFourAbi,
       functionName: "move",
       args: [gameId, column],
+      chainId: selectedChainId,
     });
   }
 
   function claimTimeout() {
-    if (gameId === undefined) return;
+    if (!canWrite || !gameAddress || gameId === undefined) return;
     writeContract({
-      address: GAME_ADDRESS,
+      address: gameAddress,
       abi: connectFourAbi,
       functionName: "claimTimeoutWin",
       args: [gameId],
+      chainId: selectedChainId,
     });
   }
 
@@ -128,7 +159,7 @@ export default function App() {
   const isMyTurn =
     !!address && !!state && state.currentTurn.toLowerCase() === address.toLowerCase();
   const canPlay =
-    !!state && state.status === Status.InProgress && isMyTurn && !isPending && !txConfirming;
+    canWrite && !!state && state.status === Status.InProgress && isMyTurn && !isPending && !txConfirming;
 
   const iAmActive = isMyTurn;
   const isPlayer = myPlayerId === 1 || myPlayerId === 2;
@@ -137,7 +168,9 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <h1>Turn by Turn</h1>
-        <span className="subtitle">Onchain Connect Four · Ethereum Sepolia</span>
+        <span className="subtitle">
+          Onchain Connect Four · {selectedMeta ? selectedMeta.name : "Unknown network"}
+        </span>
         <div className="wallet">
           {isConnected ? (
             <>
@@ -155,24 +188,52 @@ export default function App() {
         </div>
       </header>
 
-      {onWrongChain && (
+      <div className="network-picker">
+        <span className="muted">Network:</span>
+        {SUPPORTED_CHAINS.map((c) => (
+          <button
+            key={c.id}
+            className={c.id === selectedChainId ? "net active" : "net"}
+            onClick={() => setSelectedChainId(c.id)}
+          >
+            {c.name}
+            {hasContractAddress(c.id) ? "" : " — not configured"}
+          </button>
+        ))}
+      </div>
+
+      {isConnected && walletUnsupported && (
         <div className="banner warn">
-          Wrong network. This app runs on {sepolia.name} (chain {sepolia.id}).{" "}
-          <button onClick={() => switchChain({ chainId: sepolia.id })}>Switch to Sepolia</button>
+          Your wallet is on an unsupported network (chain {walletChainId}).{" "}
+          <button onClick={() => switchChain({ chainId: selectedChainId })}>
+            Switch to {selectedMeta ? selectedMeta.name : "the selected network"}
+          </button>
         </div>
       )}
 
-      {!hasContractAddress() && (
+      {isConnected && !walletUnsupported && !walletOnSelected && (
         <div className="banner warn">
-          No contract address configured. Set <code>VITE_GAME_ADDRESS</code> in{" "}
-          <code>frontend/.env</code> to a deployed ConnectFour address.
+          Your wallet is on chain {walletChainId}, but the app is set to{" "}
+          {selectedMeta ? selectedMeta.name : "another network"} (chain {selectedChainId}).{" "}
+          <button onClick={() => switchChain({ chainId: selectedChainId })}>
+            Switch wallet to {selectedMeta ? selectedMeta.shortName : "the selected network"}
+          </button>
+        </div>
+      )}
+
+      {!configured && selectedMeta && (
+        <div className="banner warn">
+          Not deployed/configured on {selectedMeta.name}. Set{" "}
+          <code>{selectedMeta.addressEnv}</code> in <code>frontend/.env</code> to a deployed
+          ConnectFour address on {selectedMeta.name} (chain {selectedMeta.id}). Addresses are
+          per network and are never shared.
         </div>
       )}
 
       <section className="panel">
         <h2>Lobby</h2>
         <div className="row">
-          <button disabled={!isConnected || !hasContractAddress()} onClick={createGame}>
+          <button disabled={!canWrite} onClick={createGame}>
             Create a new game
           </button>
           <span className="muted">
@@ -204,7 +265,12 @@ export default function App() {
             )}
           </h2>
 
-          {!state && <p className="muted">Loading game state from chain…</p>}
+          {!state && !gameRead.error && (
+            <p className="muted">Loading game state from chain…</p>
+          )}
+          {!state && gameRead.error && (
+            <p className="error">{friendlyError(gameRead.error.message)}</p>
+          )}
 
           {state && (
             <>
@@ -254,7 +320,7 @@ export default function App() {
               <div className="controls">
                 {state.status === Status.WaitingForOpponent && (
                   <button
-                    disabled={!isConnected || myPlayerId === 1 || isPending || txConfirming}
+                    disabled={!canWrite || myPlayerId === 1 || isPending || txConfirming}
                     onClick={joinGame}
                   >
                     Join this game as player 2
@@ -281,17 +347,14 @@ export default function App() {
 
           {(isPending || txConfirming) && <p className="muted">Submitting transaction…</p>}
           {txHash && <p className="muted">Tx: {shortAddr(txHash)}</p>}
-          {writeError && (
-            <p className="error">
-              {writeError.message.split("\n")[0]}
-            </p>
-          )}
+          {writeError && <p className="error">{friendlyError(writeError.message)}</p>}
         </section>
       )}
 
       <footer className="foot">
         <span>
-          Contract: {hasContractAddress() ? shortAddr(GAME_ADDRESS) : "not configured"}
+          Network: {selectedMeta ? `${selectedMeta.name} (${selectedMeta.id})` : "unknown"} ·
+          Contract: {configured ? shortAddr(gameAddress) : "not configured on this network"}
         </span>
       </footer>
     </div>

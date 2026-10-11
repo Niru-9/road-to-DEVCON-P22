@@ -30,6 +30,10 @@ h1 { font-size: 24px; margin: 0; }
 .wallet { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 .pill { background: var(--panel2); padding: 6px 10px; border-radius: 999px; font-size: 13px; }
 
+.network-picker { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+.network-picker .net { background: var(--panel2); color: var(--text); }
+.network-picker .net.active { background: var(--accent); color: #0b1020; }
+
 .banner { padding: 10px 12px; border-radius: 8px; margin: 12px 0; font-size: 14px; }
 .banner.warn { background: #3a2b16; border: 1px solid #7a5a1e; }
 .banner code { background: #00000040; padding: 1px 5px; border-radius: 4px; }

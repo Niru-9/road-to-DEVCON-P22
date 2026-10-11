@@ -14,8 +14,11 @@ contract ConnectFour {
     uint8 public constant PLAYER2 = 2;
 
     /// @dev Fixed window a player has to move before the opponent may claim a
-    ///      timeout win. Measured from the stored last-move time.
-    uint256 public constant MOVE_TIMEOUT = 1 days;
+    ///      timeout win. Measured from the stored last-move time. A stalled game
+    ///      can therefore be forfeited within a couple of minutes instead of
+    ///      being stuck for a day (the original value), so a shared game id does
+    ///      not leave the opening player unable to force a result.
+    uint256 public constant MOVE_TIMEOUT = 2 minutes;
 
     enum Status {
         WaitingForOpponent,
@@ -47,11 +50,7 @@ contract ConnectFour {
     event GameCreated(uint256 indexed gameId, address indexed player1);
     event GameJoined(uint256 indexed gameId, address indexed player1, address indexed player2);
     event MoveMade(
-        uint256 indexed gameId,
-        address indexed player,
-        uint8 column,
-        uint8 row,
-        uint8 playerId
+        uint256 indexed gameId, address indexed player, uint8 column, uint8 row, uint8 playerId
     );
     event GameFinished(uint256 indexed gameId, address indexed winner, Outcome outcome);
     event TimeoutClaimed(uint256 indexed gameId, address indexed winner);
@@ -108,7 +107,9 @@ contract ConnectFour {
         if (_isWinningMove(g, row, column, pid)) {
             g.winner = msg.sender;
             g.status = Status.Finished;
-            emit GameFinished(gameId, msg.sender, pid == PLAYER1 ? Outcome.Player1Win : Outcome.Player2Win);
+            emit GameFinished(
+                gameId, msg.sender, pid == PLAYER1 ? Outcome.Player1Win : Outcome.Player2Win
+            );
         } else if (g.moveCount == CELLS) {
             g.status = Status.Finished;
             emit GameFinished(gameId, address(0), Outcome.Draw);
@@ -130,7 +131,9 @@ contract ConnectFour {
         g.winner = msg.sender;
         g.status = Status.Finished;
         uint8 pid = msg.sender == g.player1 ? PLAYER1 : PLAYER2;
-        emit GameFinished(gameId, msg.sender, pid == PLAYER1 ? Outcome.Player1Win : Outcome.Player2Win);
+        emit GameFinished(
+            gameId, msg.sender, pid == PLAYER1 ? Outcome.Player1Win : Outcome.Player2Win
+        );
         emit TimeoutClaimed(gameId, msg.sender);
     }
 
@@ -153,15 +156,8 @@ contract ConnectFour {
         )
     {
         Game storage g = games[gameId];
-        return (
-            g.player1,
-            g.player2,
-            g.currentTurn,
-            g.winner,
-            g.status,
-            g.lastMoveTime,
-            g.moveCount
-        );
+        return
+            (g.player1, g.player2, g.currentTurn, g.winner, g.status, g.lastMoveTime, g.moveCount);
     }
 
     /// @notice Full board as a flat ROWS*COLS array (index = row*COLS + col).
@@ -171,11 +167,16 @@ contract ConnectFour {
 
     /// @notice Seconds until the current player can be forfeited (0 if already due
     ///         or the game is not in progress).
+    /// @dev `claimTimeoutWin` requires `block.timestamp > lastMoveTime + MOVE_TIMEOUT`,
+    ///      so at exactly the deadline a claim is still rejected. This view returns
+    ///      0 only once a claim would actually succeed, so a UI driven by it cannot
+    ///      fire an early, reverting claim.
     function timeUntilTimeout(uint256 gameId) external view gameExists(gameId) returns (uint256) {
         Game storage g = games[gameId];
         if (g.status != Status.InProgress) return 0;
         uint256 deadline = uint256(g.lastMoveTime) + MOVE_TIMEOUT;
-        if (block.timestamp >= deadline) return 0;
+        if (block.timestamp > deadline) return 0; // claim is now accepted
+        if (block.timestamp == deadline) return 1; // one more second before a claim succeeds
         return deadline - block.timestamp;
     }
 
@@ -226,14 +227,11 @@ contract ConnectFour {
         return count >= 4;
     }
 
-    function _countDirection(
-        Game storage g,
-        int8 row,
-        int8 column,
-        int8 dr,
-        int8 dc,
-        uint8 pid
-    ) private view returns (uint8 count) {
+    function _countDirection(Game storage g, int8 row, int8 column, int8 dr, int8 dc, uint8 pid)
+        private
+        view
+        returns (uint8 count)
+    {
         int8 r = row + dr;
         int8 c = column + dc;
         while (

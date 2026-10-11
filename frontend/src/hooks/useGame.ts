@@ -1,7 +1,14 @@
 import { useMemo } from "react";
 import { useReadContract, useWatchContractEvent } from "wagmi";
 import { connectFourAbi } from "../abi";
-import { GAME_ADDRESS, hasContractAddress } from "../wagmi";
+import { contractAddressFor } from "../wagmi";
+
+// One shared, deliberately slow cadence for both the periodic reads and the
+// event watchers. Public Sepolia RPC endpoints rate-limit (HTTP 429) long before
+// a human cares about sub-15s freshness, and an open game already refreshes
+// immediately on an event or on the player's own confirmed write.
+const READ_REFETCH_MS = 15_000;
+const EVENT_POLL_MS = 15_000;
 
 export interface GameState {
   player1: `0x${string}`;
@@ -13,35 +20,41 @@ export interface GameState {
   moveCount: number;
 }
 
-export function useGame(gameId?: bigint) {
-  const enabled = gameId !== undefined && hasContractAddress();
+export function useGame(gameId: bigint | undefined, chainId: number) {
+  // Reads and events are pinned to the app's selected chain, independent of
+  // which chain the wallet happens to be on.
+  const address = contractAddressFor(chainId);
+  const enabled = gameId !== undefined && address !== undefined;
   const args = useMemo(
     () => (gameId !== undefined ? ([gameId] as const) : undefined),
     [gameId],
   );
 
   const game = useReadContract({
-    address: GAME_ADDRESS,
+    address,
     abi: connectFourAbi,
     functionName: "getGame",
     args,
-    query: { enabled, refetchInterval: 6000 },
+    chainId,
+    query: { enabled, refetchInterval: READ_REFETCH_MS },
   });
 
   const board = useReadContract({
-    address: GAME_ADDRESS,
+    address,
     abi: connectFourAbi,
     functionName: "getBoard",
     args,
-    query: { enabled, refetchInterval: 6000 },
+    chainId,
+    query: { enabled, refetchInterval: READ_REFETCH_MS },
   });
 
   const timeout = useReadContract({
-    address: GAME_ADDRESS,
+    address,
     abi: connectFourAbi,
     functionName: "timeUntilTimeout",
     args,
-    query: { enabled, refetchInterval: 3000 },
+    chainId,
+    query: { enabled, refetchInterval: READ_REFETCH_MS },
   });
 
   const refetchAll = () => {
@@ -50,34 +63,30 @@ export function useGame(gameId?: bigint) {
     timeout.refetch();
   };
 
-  // Live updates: any chain event for this game refreshes the view, so an open
-  // page changes without a reload.
+  // Live updates. To stay well under public-RPC rate limits we use two watchers
+  // (not four) and a slower poll shared with the reads:
+  //   - MoveMade covers every move, including a winning/drawing final move (the
+  //     contract emits GameFinished alongside that MoveMade), so it refreshes
+  //     the board, the turn and the result in one event.
+  //   - GameJoined lets the opening player see the opponent join promptly.
+  // A timeout claim (rare, no MoveMade) is picked up by the slow poll; the
+  // acting player's own write also triggers refetchAll() from App.tsx.
   useWatchContractEvent({
-    address: GAME_ADDRESS,
+    address,
     abi: connectFourAbi,
     eventName: "MoveMade",
+    chainId,
     enabled,
+    pollingInterval: EVENT_POLL_MS,
     onLogs: refetchAll,
   });
   useWatchContractEvent({
-    address: GAME_ADDRESS,
+    address,
     abi: connectFourAbi,
     eventName: "GameJoined",
+    chainId,
     enabled,
-    onLogs: refetchAll,
-  });
-  useWatchContractEvent({
-    address: GAME_ADDRESS,
-    abi: connectFourAbi,
-    eventName: "GameFinished",
-    enabled,
-    onLogs: refetchAll,
-  });
-  useWatchContractEvent({
-    address: GAME_ADDRESS,
-    abi: connectFourAbi,
-    eventName: "TimeoutClaimed",
-    enabled,
+    pollingInterval: EVENT_POLL_MS,
     onLogs: refetchAll,
   });
 
